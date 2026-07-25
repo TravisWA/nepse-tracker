@@ -1,19 +1,36 @@
 [app]
+
 title = NEPSE Tracker
 package.name = nepsetracker
-package.domain = com.nepsetracker
+package.domain = com.mynepse
+
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
+
 version = 1.0
-requirements = python3,kivy==2.3.0,requests,beautifulsoup4,certifi,urllib3
+
+# Simpler requirements - more stable
+requirements = python3,kivy,requests,urllib3,charset-normalizer,idna,certifi,beautifulsoup4,soupsieve
+
 orientation = portrait
 fullscreen = 0
-android.permissions = INTERNET,ACCESS_NETWORK_STATE
-android.api = 33
+
+# Android settings
+android.permissions = android.permission.INTERNET
+android.api = 31
 android.minapi = 21
-android.ndk = 25b
+android.ndk = 23b
 android.accept_sdk_license = True
-android.archs = arm64-v8a, armeabi-v7a
+
+# Only ARM64 (most modern phones) - faster build
+android.archs = arm64-v8a
+
+# APK output
+android.release_artifact = apk
+
+# Icon (optional)
+# icon.filename = %(source.dir)s/icon.png
 
 [buildozer]
-log_level = 2
+log_level = 1
+warn_on_root = 0
