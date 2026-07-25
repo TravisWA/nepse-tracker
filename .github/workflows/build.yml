@@ -7,17 +7,16 @@ on:
 
 jobs:
   build:
-    name: Build for Android
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Python 3.9
+    - name: Setup Python 3.11
       uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
+        python-version: '3.11'
 
     - name: Setup Java 17
       uses: actions/setup-java@v4
@@ -39,29 +38,31 @@ jobs:
     - name: Install Python packages
       run: |
         python -m pip install --upgrade pip
-        pip install --upgrade wheel
+        pip install --upgrade wheel setuptools
         pip install --upgrade Cython==0.29.36
         pip install --upgrade buildozer==1.5.0
         pip install --upgrade virtualenv
 
-    - name: Cache buildozer global directory
+    - name: Cache buildozer
       uses: actions/cache@v4
       with:
         path: ~/.buildozer
-        key: buildozer-${{ hashFiles('buildozer.spec') }}
+        key: buildozer-v3-${{ hashFiles('buildozer.spec') }}
 
     - name: Build APK
       run: |
         buildozer android debug 2>&1 | tee build_output.log
-        echo "===== END OF BUILD ====="
-        echo "Contents of bin folder:"
-        ls -la bin/ 2>/dev/null || echo "bin folder does not exist!"
 
-    - name: Show last 200 lines if build failed
-      if: failure()
+    - name: Check APK
       run: |
-        echo "===== LAST 200 LINES OF BUILD LOG ====="
-        tail -200 build_output.log
+        if ls bin/*.apk 1> /dev/null 2>&1; then
+          echo "✅ SUCCESS!"
+          ls -la bin/
+        else
+          echo "❌ FAILED - Last 200 lines:"
+          tail -200 build_output.log
+          exit 1
+        fi
 
     - name: Upload APK
       if: success()
@@ -69,12 +70,10 @@ jobs:
       with:
         name: NEPSE-Tracker-APK
         path: bin/*.apk
-        if-no-files-found: error
 
-    - name: Upload build log
+    - name: Upload log
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-log
+        name: full-build-log
         path: build_output.log
-        retention-days: 30
