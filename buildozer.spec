@@ -9,28 +9,20 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 1.0
 
-# Simpler requirements - more stable
-requirements = python3,kivy,requests,urllib3,charset-normalizer,idna,certifi,beautifulsoup4,soupsieve
+# Simplified requirements - just the essentials
+requirements = python3,kivy==2.1.0,requests,certifi,charset-normalizer,idna,urllib3
 
 orientation = portrait
 fullscreen = 0
 
-# Android settings
-android.permissions = android.permission.INTERNET
+android.permissions = INTERNET
 android.api = 31
 android.minapi = 21
-android.ndk = 23b
+android.ndk = 25b
 android.accept_sdk_license = True
-
-# Only ARM64 (most modern phones) - faster build
 android.archs = arm64-v8a
 
-# APK output
-android.release_artifact = apk
-
-# Icon (optional)
-# icon.filename = %(source.dir)s/icon.png
-
+# IMPORTANT: log_level 2 shows real errors
 [buildozer]
-log_level = 1
-warn_on_root = 0
+log_level = 2
+warn_on_root = 1
