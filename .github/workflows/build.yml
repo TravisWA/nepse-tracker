@@ -39,15 +39,14 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install --upgrade wheel setuptools
-        pip install --upgrade Cython==0.29.36
-        pip install --upgrade buildozer==1.5.0
-        pip install --upgrade virtualenv
+        pip install Cython==0.29.36
+        pip install buildozer==1.5.0
+        pip install virtualenv
 
-    - name: Cache buildozer
-      uses: actions/cache@v4
-      with:
-        path: ~/.buildozer
-        key: buildozer-v3-${{ hashFiles('buildozer.spec') }}
+    - name: Clear old buildozer cache
+      run: |
+        rm -rf ~/.buildozer
+        rm -rf .buildozer
 
     - name: Build APK
       run: |
@@ -59,8 +58,8 @@ jobs:
           echo "✅ SUCCESS!"
           ls -la bin/
         else
-          echo "❌ FAILED - Last 200 lines:"
-          tail -200 build_output.log
+          echo "❌ FAILED - Last 300 lines:"
+          tail -300 build_output.log
           exit 1
         fi
 
