@@ -9,7 +9,6 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 1.0
 
-# Simplified requirements - just the essentials
 requirements = python3,kivy==2.1.0,requests,certifi,charset-normalizer,idna,urllib3
 
 orientation = portrait
@@ -22,7 +21,6 @@ android.ndk = 25b
 android.accept_sdk_license = True
 android.archs = arm64-v8a
 
-# IMPORTANT: log_level 2 shows real errors
 [buildozer]
 log_level = 2
 warn_on_root = 1
