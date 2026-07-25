@@ -1,15 +1,25 @@
 """
-NEPSE Portfolio Tracker
-Personal Use App with Ethical Rate Limiting
+NEPSE Portfolio Tracker v2.0
+Personal Portfolio Management App
+
+Features:
+- Portfolio tracking with WACC
+- Manual price entry (offline capable)
+- Auto-fetch from 3rd party sources only
+- NEPSE Index tracking
+- Watchlist
+- All SEBON charge calculations
+- CGT calculations (7.5% / 10%)
+- Ethical rate limiting
+
+Data Sources (3rd party, public):
+- ShareSansar (sharesansar.com)
+- NEPSE Alpha (nepsealpha.com)
+- MeroLagani (merolagani.com)
 
 DISCLAIMER:
-- For personal portfolio tracking only
-- Uses publicly available NEPSE price data
-- Respects server load with 3+ second delays
-- Auto-refresh limited to 10 minutes
-- Not for commercial or automated trading use
-- User should verify prices from official
-  NEPSE sources before making decisions
+Personal use only. Verify prices from
+official sources before making decisions.
 """
 
 import os
@@ -41,12 +51,12 @@ from kivy.graphics import (
 )
 
 # ══════════════════════════════
-# ETHICAL FETCHING SETTINGS
+# ETHICAL SETTINGS
 # ══════════════════════════════
-FETCH_DELAY_SECONDS = 3.0       # Wait 3s between requests
-AUTO_REFRESH_MINUTES = 10       # Auto refresh every 10 min
-MIN_MANUAL_REFRESH_SECS = 60    # Manual refresh: max once per min
-MARKET_ONLY_AUTO = True         # Only refresh in market hours
+FETCH_DELAY_SECONDS = 3.0
+AUTO_REFRESH_MINUTES = 10
+MIN_MANUAL_REFRESH_SECS = 60
+MARKET_ONLY_AUTO = True
 
 # ══════════════════════════════
 # COLORS
@@ -64,13 +74,11 @@ ORANGE = [0.86, 0.43, 0.16, 1]
 PURPLE = [0.74, 0.55, 1.00, 1]
 BLACK  = [0.04, 0.04, 0.05, 1]
 WHITE  = [1.00, 1.00, 1.00, 1]
+CYAN   = [0.40, 0.85, 0.90, 1]
 
 
 # ══════════════════════════════
 # CHARGE CALCULATOR
-# All rates per SEBON regulations
-# CGT: 7.5% short, 10% long
-# Market: Mon-Fri 11AM-3PM
 # ══════════════════════════════
 class Calc:
     SLABS = [
@@ -280,33 +288,32 @@ class DB:
                 day_high REAL DEFAULT 0,
                 day_low REAL DEFAULT 0,
                 volume INTEGER DEFAULT 0,
+                updated TEXT,
+                source TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS
+            watchlist (
+                symbol TEXT PRIMARY KEY,
+                company TEXT DEFAULT '',
+                target_buy REAL DEFAULT 0,
+                target_sell REAL DEFAULT 0,
+                notes TEXT DEFAULT '',
+                added_date TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS
+            nepse_index (
+                id INTEGER PRIMARY KEY
+                   AUTOINCREMENT,
+                date TEXT,
+                index_value REAL DEFAULT 0,
+                change_points REAL DEFAULT 0,
+                change_percent REAL DEFAULT 0,
+                total_volume INTEGER DEFAULT 0,
+                total_turnover REAL DEFAULT 0,
+                total_trades INTEGER DEFAULT 0,
                 updated TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS
-            dividends (
-                id INTEGER PRIMARY KEY
-                   AUTOINCREMENT,
-                record_date TEXT,
-                symbol TEXT,
-                div_type TEXT,
-                rate REAL DEFAULT 0,
-                gross REAL DEFAULT 0,
-                tax REAL DEFAULT 0,
-                net REAL DEFAULT 0,
-                notes TEXT DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS
-            corp_actions (
-                id INTEGER PRIMARY KEY
-                   AUTOINCREMENT,
-                action_date TEXT,
-                symbol TEXT,
-                action_type TEXT,
-                details TEXT DEFAULT '',
-                new_shares INTEGER DEFAULT 0,
-                cost_added REAL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS
@@ -320,6 +327,7 @@ class DB:
             ('target2', '20'),
             ('target3', '30'),
             ('last_manual_refresh', '0'),
+            ('auto_refresh_enabled', 'yes'),
         ]
         for k, v in defaults:
             self.conn.execute(
@@ -341,12 +349,14 @@ class DB:
         return self.conn.execute(
             sql, p).fetchone()
 
-    def save_price(self, sym, data):
+    def save_price(self, sym, data,
+                   source=''):
         self.run('''
             INSERT OR REPLACE INTO prices
             (symbol,price,prev_close,
-             day_high,day_low,volume,updated)
-            VALUES(?,?,?,?,?,?,?)
+             day_high,day_low,volume,
+             updated,source)
+            VALUES(?,?,?,?,?,?,?,?)
         ''', (
             sym,
             data.get('price', 0),
@@ -354,8 +364,33 @@ class DB:
             data.get('high', 0),
             data.get('low', 0),
             data.get('vol', 0),
+            str(datetime.datetime.now()),
+            source
+        ))
+
+    def save_index(self, data):
+        self.run('''
+            INSERT INTO nepse_index
+            (date, index_value,
+             change_points, change_percent,
+             total_volume, total_turnover,
+             total_trades, updated)
+            VALUES(?,?,?,?,?,?,?,?)
+        ''', (
+            str(datetime.date.today()),
+            data.get('index', 0),
+            data.get('change', 0),
+            data.get('change_pct', 0),
+            data.get('volume', 0),
+            data.get('turnover', 0),
+            data.get('trades', 0),
             str(datetime.datetime.now())
         ))
+
+    def get_latest_index(self):
+        return self.one(
+            'SELECT * FROM nepse_index'
+            ' ORDER BY id DESC LIMIT 1')
 
     def setting(self, key, default=''):
         r = self.one(
@@ -372,28 +407,29 @@ class DB:
 
 
 # ══════════════════════════════
-# ETHICAL DATA FETCHER
+# THIRD-PARTY DATA FETCHER
 # 
-# Respects server resources:
-# - 3 second delay between requests
-# - Only fetches user's stocks
-# - Standard browser headers
-# - No aggressive polling
+# Sources (public):
+# 1. ShareSansar
+# 2. NEPSE Alpha  
+# 3. MeroLagani
+# 
+# NO direct NEPSE fetching
+# All ethical rate limiting
 # ══════════════════════════════
 class Fetcher:
     UA = {
         'User-Agent': (
             'Mozilla/5.0 (Linux; Android 10)'
             ' AppleWebKit/537.36'
-        )
+        ),
+        'Accept': 'text/html,application/json',
     }
 
-    # Track last fetch time to enforce delays
     _last_fetch_time = 0
 
     @classmethod
     def _wait_delay(cls):
-        """Enforce minimum delay between requests"""
         elapsed = time.time() - cls._last_fetch_time
         if elapsed < FETCH_DELAY_SECONDS:
             wait = FETCH_DELAY_SECONDS - elapsed
@@ -401,57 +437,172 @@ class Fetcher:
         cls._last_fetch_time = time.time()
 
     @classmethod
-    def fetch(cls, symbol):
-        """
-        Fetch stock price - respects rate limits
-        Waits 3+ seconds between each request
-        """
-        # Wait for rate limit
+    def fetch_price(cls, symbol):
+        """Try 3rd party sources only"""
         cls._wait_delay()
 
-        # Source 1: NEPSE Official Public API
+        # Source 1: ShareSansar
+        result = cls._sharesansar(symbol)
+        if result:
+            result['source'] = 'ShareSansar'
+            return result
+
+        time.sleep(2)
+
+        # Source 2: NEPSE Alpha
+        result = cls._nepsealpha(symbol)
+        if result:
+            result['source'] = 'NEPSE Alpha'
+            return result
+
+        time.sleep(2)
+
+        # Source 3: MeroLagani (backup)
+        result = cls._merolagani(symbol)
+        if result:
+            result['source'] = 'MeroLagani'
+            return result
+
+        return None
+
+    @classmethod
+    def _sharesansar(cls, symbol):
+        """ShareSansar public data"""
         try:
             import requests
-            r = requests.get(
-                'https://nepalstock.com.np'
-                '/api/nots/nepse-data'
-                '/today-price',
-                headers=cls.UA,
-                timeout=15,
-                verify=True
+            url = (
+                'https://www.sharesansar.com'
+                f'/company/{symbol.lower()}'
             )
+            r = requests.get(
+                url, headers=cls.UA,
+                timeout=15, verify=True)
+
             if r.status_code == 200:
-                for item in r.json().get(
-                        'content', []):
-                    if (item.get('symbol', '')
-                            .upper() ==
-                            symbol.upper()):
+                text = r.text
+
+                # Multiple patterns to try
+                patterns = {
+                    'price': [
+                        r'Last\s+Traded\s+Price'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                        r'ltp["\s:]+([\d,]+\.\d+)',
+                    ],
+                    'prev': [
+                        r'Previous\s+Close'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                    ],
+                    'high': [
+                        r'Day.?s?\s+High'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                        r'High\s+Price'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                    ],
+                    'low': [
+                        r'Day.?s?\s+Low'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                        r'Low\s+Price'
+                        r'[^0-9]*?([\d,]+\.\d+)',
+                    ],
+                    'vol': [
+                        r'Volume'
+                        r'[^0-9]*?([\d,]+)',
+                        r'Total\s+Traded\s+Qty'
+                        r'[^0-9]*?([\d,]+)',
+                    ],
+                }
+
+                def find(patterns_list):
+                    for p in patterns_list:
+                        m = re.search(
+                            p, text,
+                            re.IGNORECASE)
+                        if m:
+                            try:
+                                v = m.group(1)\
+                                    .replace(
+                                        ',', '')
+                                return float(v)
+                            except Exception:
+                                continue
+                    return 0
+
+                price = find(patterns['price'])
+                if price > 0:
+                    return {
+                        'price': price,
+                        'prev': find(
+                            patterns['prev']),
+                        'high': find(
+                            patterns['high']),
+                        'low': find(
+                            patterns['low']),
+                        'vol': int(find(
+                            patterns['vol'])),
+                    }
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _nepsealpha(cls, symbol):
+        """NEPSE Alpha public API"""
+        try:
+            import requests
+            # Get chart data
+            end_ts = int(time.time())
+            start_ts = end_ts - (7 * 86400)
+
+            url = (
+                'https://www.nepsealpha.com'
+                '/trading/1/history'
+                f'?symbol={symbol.upper()}'
+                '&resolution=1D'
+                f'&from={start_ts}'
+                f'&to={end_ts}'
+            )
+            r = requests.get(
+                url, headers=cls.UA,
+                timeout=15, verify=True)
+
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('s') == 'ok':
+                    closes = data.get('c', [])
+                    highs = data.get('h', [])
+                    lows = data.get('l', [])
+                    vols = data.get('v', [])
+
+                    if closes:
+                        current = float(
+                            closes[-1])
+                        prev = (
+                            float(closes[-2])
+                            if len(closes) > 1
+                            else current)
                         return {
-                            'price': float(
-                                item.get(
-                                'lastTradedPrice',
-                                0)),
-                            'prev': float(
-                                item.get(
-                                'previousClose',
-                                0)),
-                            'high': float(
-                                item.get(
-                                'highPrice',0)),
-                            'low': float(
-                                item.get(
-                                'lowPrice',0)),
-                            'vol': int(item.get(
-                                'totalTrade'
-                                'Quantity',0)),
+                            'price': current,
+                            'prev': prev,
+                            'high': (
+                                float(highs[-1])
+                                if highs
+                                else current),
+                            'low': (
+                                float(lows[-1])
+                                if lows
+                                else current),
+                            'vol': (
+                                int(vols[-1])
+                                if vols
+                                else 0),
                         }
         except Exception:
             pass
+        return None
 
-        # Extra wait before trying source 2
-        time.sleep(2)
-
-        # Source 2: MeroLagani (backup)
+    @classmethod
+    def _merolagani(cls, symbol):
+        """MeroLagani - backup source"""
         try:
             import requests
             url = (
@@ -462,6 +613,7 @@ class Fetcher:
             r = requests.get(
                 url, headers=cls.UA,
                 timeout=15, verify=True)
+
             if r.status_code == 200:
                 text = r.text
 
@@ -498,12 +650,159 @@ class Fetcher:
                     }
         except Exception:
             pass
+        return None
+
+    @classmethod
+    def fetch_nepse_index(cls):
+        """Fetch NEPSE index from 3rd party"""
+        cls._wait_delay()
+
+        # Try ShareSansar
+        try:
+            import requests
+            url = (
+                'https://www.sharesansar.com'
+                '/live-trading'
+            )
+            r = requests.get(
+                url, headers=cls.UA,
+                timeout=15, verify=True)
+
+            if r.status_code == 200:
+                text = r.text
+
+                # NEPSE Index
+                idx_pat = (
+                    r'NEPSE\s+Index'
+                    r'[^0-9]*?([\d,]+\.\d+)'
+                )
+                idx_m = re.search(
+                    idx_pat, text,
+                    re.IGNORECASE)
+
+                if idx_m:
+                    idx_val = float(
+                        idx_m.group(1)
+                        .replace(',', ''))
+
+                    # Change (points)
+                    chg_pat = (
+                        r'NEPSE.*?'
+                        r'([+-]?[\d,]+\.\d+)'
+                        r'\s*\('
+                        r'([+-]?\d+\.\d+)%\)'
+                    )
+                    chg_m = re.search(
+                        chg_pat, text,
+                        re.DOTALL)
+
+                    change = 0
+                    change_pct = 0
+                    if chg_m:
+                        try:
+                            change = float(
+                                chg_m.group(1)
+                                .replace(',',''))
+                            change_pct = float(
+                                chg_m.group(2))
+                        except Exception:
+                            pass
+
+                    # Volume
+                    vol_pat = (
+                        r'Total\s+Volume'
+                        r'[^0-9]*?([\d,]+)'
+                    )
+                    vol_m = re.search(
+                        vol_pat, text,
+                        re.IGNORECASE)
+                    volume = 0
+                    if vol_m:
+                        try:
+                            volume = int(
+                                vol_m.group(1)
+                                .replace(',',''))
+                        except Exception:
+                            pass
+
+                    # Turnover
+                    tur_pat = (
+                        r'Total\s+Turnover'
+                        r'[^0-9]*?([\d,]+\.\d+)'
+                    )
+                    tur_m = re.search(
+                        tur_pat, text,
+                        re.IGNORECASE)
+                    turnover = 0
+                    if tur_m:
+                        try:
+                            turnover = float(
+                                tur_m.group(1)
+                                .replace(',',''))
+                        except Exception:
+                            pass
+
+                    return {
+                        'index': idx_val,
+                        'change': change,
+                        'change_pct': change_pct,
+                        'volume': volume,
+                        'turnover': turnover,
+                        'trades': 0,
+                    }
+        except Exception:
+            pass
+
+        # Fallback: NEPSE Alpha for index
+        try:
+            import requests
+            url = (
+                'https://www.nepsealpha.com'
+                '/trading/1/history'
+                '?symbol=NEPSE'
+                '&resolution=1D'
+                f'&from={int(time.time())-86400}'
+                f'&to={int(time.time())}'
+            )
+            r = requests.get(
+                url, headers=cls.UA,
+                timeout=15, verify=True)
+
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('s') == 'ok':
+                    closes = data.get('c', [])
+                    vols = data.get('v', [])
+                    if closes:
+                        current = float(
+                            closes[-1])
+                        prev = (
+                            float(closes[-2])
+                            if len(closes) > 1
+                            else current)
+                        change = current - prev
+                        change_pct = (
+                            change / prev * 100
+                            if prev else 0)
+                        return {
+                            'index': current,
+                            'change': round(
+                                change, 2),
+                            'change_pct': round(
+                                change_pct, 2),
+                            'volume': (
+                                int(vols[-1])
+                                if vols else 0),
+                            'turnover': 0,
+                            'trades': 0,
+                        }
+        except Exception:
+            pass
 
         return None
 
     @classmethod
     def can_manual_refresh(cls, db):
-        """Check if enough time passed since last manual refresh"""
         try:
             last = float(
                 db.setting(
@@ -521,7 +820,6 @@ class Fetcher:
 
     @classmethod
     def mark_manual_refresh(cls, db):
-        """Record time of manual refresh"""
         db.set_setting(
             'last_manual_refresh',
             time.time())
@@ -576,11 +874,20 @@ class Portfolio:
             ' WHERE symbol=?', (symbol,))
         cmp_ = pc['price'] if pc else 0
         prev = pc['prev_close'] if pc else 0
+        high = pc['day_high'] if pc else 0
+        low_ = pc['day_low'] if pc else 0
+        vol  = pc['volume'] if pc else 0
+        src  = (pc['source']
+                if pc and 'source' in pc.keys()
+                else '')
 
         cv   = cq * cmp_ if cmp_ else 0
         upl  = cv - tc if cmp_ else 0
         plp  = (upl / tc * 100
                 if tc and cmp_ else 0)
+        dchg = cmp_ - prev if cmp_ and prev else 0
+        dpct = (dchg / prev * 100
+                if prev and cmp_ else 0)
 
         sc   = (Calc.sell(cq, cmp_)
                 if cmp_ else {})
@@ -613,6 +920,12 @@ class Portfolio:
             'tc':   round(tc, 2),
             'cmp':  cmp_,
             'prev': prev,
+            'high': high,
+            'low':  low_,
+            'vol':  vol,
+            'src':  src,
+            'dchg': round(dchg, 2),
+            'dpct': round(dpct, 2),
             'cv':   round(cv, 2),
             'upl':  round(upl, 2),
             'plp':  round(plp, 2),
@@ -806,7 +1119,8 @@ def make_nav(sm, current):
         ('Home', 'dash'),
         ('Port', 'port'),
         ('Add',  'add'),
-        ('Hist', 'history'),
+        ('Watch','watch'),
+        ('Manual','manual'),
         ('Info', 'info'),
     ]
     nav = BoxLayout(
@@ -817,7 +1131,7 @@ def make_nav(sm, current):
     for label, name in items:
         bg = BLUE if name == current else CARD2
         btn = Button(
-            text=label, font_size=sp(11),
+            text=label, font_size=sp(10),
             background_normal='',
             background_color=bg,
             color=WHITE)
@@ -832,6 +1146,7 @@ def make_nav(sm, current):
 
 # ══════════════════════════════
 # DASHBOARD SCREEN
+# with NEPSE INDEX
 # ══════════════════════════════
 class DashScreen(Screen):
     def __init__(self, **kw):
@@ -850,6 +1165,7 @@ class DashScreen(Screen):
         root = BoxLayout(orientation='vertical')
         set_bg(root, BG)
 
+        # Header
         hdr = BoxLayout(
             size_hint_y=None, height=dp(52),
             padding=[dp(12), dp(8)])
@@ -864,22 +1180,72 @@ class DashScreen(Screen):
         hdr.add_widget(self.title_lbl)
         hdr.add_widget(self.mkt_lbl)
 
+        # NEPSE INDEX CARD
+        idx_card = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            height=dp(80),
+            padding=dp(10),
+            spacing=dp(2))
+        set_card_bg(idx_card, CARD)
+
+        idx_hdr = BoxLayout(
+            size_hint_y=None,
+            height=dp(20))
+        idx_hdr.add_widget(L(
+            'NEPSE INDEX', size=10,
+            color=CYAN, bold=True))
+        self.idx_time = L(
+            '', size=8, color=DIM,
+            halign='right')
+        idx_hdr.add_widget(self.idx_time)
+        idx_card.add_widget(idx_hdr)
+
+        idx_row = BoxLayout(
+            size_hint_y=None,
+            height=dp(28))
+        self.idx_val = L(
+            '---', size=18, bold=True,
+            color=CYAN,
+            size_hint_x=0.4)
+        self.idx_chg = L(
+            '---', size=13, bold=True,
+            color=DIM,
+            size_hint_x=0.35,
+            halign='center')
+        self.idx_vol = L(
+            '---', size=10,
+            color=DIM,
+            size_hint_x=0.25,
+            halign='right')
+        idx_row.add_widget(self.idx_val)
+        idx_row.add_widget(self.idx_chg)
+        idx_row.add_widget(self.idx_vol)
+        idx_card.add_widget(idx_row)
+
+        self.idx_info = L(
+            'Tap Refresh to load NEPSE data',
+            size=9, color=DIM, height=15)
+        idx_card.add_widget(self.idx_info)
+
+        # Refresh row
         ref_row = BoxLayout(
             size_hint_y=None, height=dp(50),
             padding=[dp(8), dp(4)],
             spacing=dp(8))
         set_bg(ref_row, BG)
-        ref_btn = B('Refresh Prices',
+        ref_btn = B('Refresh All',
                     self._refresh,
                     bg=GREEN, height=42)
         self.upd_lbl = L(
-            'Auto-refresh: 10 min',
+            'Auto: 10 min',
             size=9,
             color=DIM, height=42,
             halign='right')
         ref_row.add_widget(ref_btn)
         ref_row.add_widget(self.upd_lbl)
 
+        # Portfolio summary cards
         cards = GridLayout(
             cols=2, size_hint_y=None,
             height=dp(160), spacing=dp(5),
@@ -912,6 +1278,7 @@ class DashScreen(Screen):
             'Loading...', size=10,
             color=DIM, height=24)
 
+        # Holdings list
         sv = ScrollView(do_scroll_x=False)
         self.holdings_box = BoxLayout(
             orientation='vertical',
@@ -925,6 +1292,7 @@ class DashScreen(Screen):
         nav = make_nav(self.manager, 'dash')
 
         root.add_widget(hdr)
+        root.add_widget(idx_card)
         root.add_widget(ref_row)
         root.add_widget(cards)
         root.add_widget(self.stats_lbl)
@@ -937,6 +1305,40 @@ class DashScreen(Screen):
         hs = self.port.all_holdings()
         self.mkt_lbl.text = (
             Calc.market_status())
+
+        # NEPSE Index
+        db = DB.get()
+        idx = db.get_latest_index()
+        if idx:
+            self.idx_val.text = (
+                f"{idx['index_value']:,.2f}")
+            chg = idx['change_points']
+            pct = idx['change_percent']
+            arr = '▲' if chg >= 0 else '▼'
+            col = GREEN if chg >= 0 else RED
+            self.idx_chg.text = (
+                f"{arr} {abs(chg):.2f}\n"
+                f"({pct:+.2f}%)")
+            self.idx_chg.color = col
+            vol = idx['total_volume'] or 0
+            if vol > 0:
+                self.idx_vol.text = (
+                    f"Vol: {vol/1e6:.1f}M")
+            else:
+                self.idx_vol.text = ''
+            try:
+                dt = idx['updated'][:16]
+                self.idx_time.text = dt
+                self.idx_info.text = (
+                    f"Source: 3rd party APIs")
+            except Exception:
+                pass
+        else:
+            self.idx_val.text = '---'
+            self.idx_chg.text = '---'
+            self.idx_vol.text = ''
+
+        # Portfolio cards
         self.card_lbl['inv'].text = (
             f"Rs {t['inv']:,.0f}")
         self.card_lbl['val'].text = (
@@ -951,11 +1353,12 @@ class DashScreen(Screen):
         self.stats_lbl.text = (
             f"  {t['n']} stocks held")
 
+        # Holdings
         self.holdings_box.clear_widgets()
         for h in hs:
             row = BoxLayout(
                 size_hint_y=None,
-                height=dp(58),
+                height=dp(65),
                 padding=dp(6),
                 spacing=dp(4))
             set_card_bg(row, CARD, 6)
@@ -963,38 +1366,46 @@ class DashScreen(Screen):
                     else RED)
             cmp_s = (f"Rs {h['cmp']:,.0f}"
                      if h['cmp'] else 'N/A')
+            dchg_s = ''
+            if h['cmp'] and h['dchg']:
+                arr = ('▲' if h['dchg'] >= 0
+                       else '▼')
+                dchg_s = (
+                    f"{arr}{abs(h['dchg']):.1f}")
+
             row.add_widget(L(
                 f"[b]{h['symbol']}[/b]\n"
                 f"{h['cq']}sh",
                 size=11, markup=True,
-                size_hint_x=0.25))
+                size_hint_x=0.22))
             row.add_widget(L(
-                cmp_s, size=11, color=BLUE,
-                size_hint_x=0.25,
+                f"{cmp_s}\n{dchg_s}",
+                size=10, color=BLUE,
+                size_hint_x=0.22,
                 halign='center'))
             row.add_widget(L(
                 (f"{h['plp']:.1f}%"
                  if h['cmp'] else 'N/A'),
                 size=11, color=pl_c,
-                size_hint_x=0.2,
+                size_hint_x=0.18,
                 halign='center'))
+            vol_s = (f"V:{h['vol']/1000:.0f}K"
+                     if h['vol'] else '')
             row.add_widget(L(
-                h['sig'], size=9,
+                f"{h['sig']}\n{vol_s}",
+                size=9,
                 color=h['scol'],
-                size_hint_x=0.3,
+                size_hint_x=0.38,
                 halign='center'))
             self.holdings_box.add_widget(row)
 
     def _refresh(self):
-        # Prevent multiple simultaneous fetches
         if self._is_fetching:
             show_msg(
                 'Please Wait',
-                'Already fetching prices.\n'
-                'Please wait for it to finish.')
+                'Already fetching!')
             return
 
-        # Check rate limit
         db = DB.get()
         can_refresh, wait = (
             Fetcher.can_manual_refresh(db))
@@ -1002,36 +1413,46 @@ class DashScreen(Screen):
         if not can_refresh:
             show_msg(
                 'Please Wait',
-                f'To protect NEPSE server,\n'
-                f'manual refresh limited to\n'
-                f'once per minute.\n\n'
-                f'Please wait {wait} seconds.')
+                f'Rate limit protection.\n'
+                f'Wait {wait} seconds.')
             return
 
         self._is_fetching = True
         Fetcher.mark_manual_refresh(db)
-        self.upd_lbl.text = (
-            'Fetching (3s per stock)...')
+        self.upd_lbl.text = 'Fetching...'
 
         def fetch():
             try:
+                # Fetch NEPSE Index first
+                idx = Fetcher.fetch_nepse_index()
+                if idx:
+                    db.save_index(idx)
+
+                # Then stock prices
                 syms = db.all(
                     'SELECT DISTINCT symbol'
                     ' FROM transactions'
                     ' WHERE trans_type="BUY"')
-                total = len(syms)
-                if total == 0:
-                    Clock.schedule_once(
-                        lambda dt:
-                        self._no_stocks(), 0)
-                    return
-
-                for i, s in enumerate(syms):
-                    d = Fetcher.fetch(
+                for s in syms:
+                    d = Fetcher.fetch_price(
                         s['symbol'])
                     if d:
                         db.save_price(
-                            s['symbol'], d)
+                            s['symbol'], d,
+                            d.get('source',''))
+
+                # Watchlist prices too
+                wl = db.all(
+                    'SELECT symbol'
+                    ' FROM watchlist')
+                for w in wl:
+                    d = Fetcher.fetch_price(
+                        w['symbol'])
+                    if d:
+                        db.save_price(
+                            w['symbol'], d,
+                            d.get('source',''))
+
                 Clock.schedule_once(
                     lambda dt: self._done(), 0)
             finally:
@@ -1039,15 +1460,6 @@ class DashScreen(Screen):
 
         threading.Thread(
             target=fetch, daemon=True).start()
-
-    @mainthread
-    def _no_stocks(self):
-        self._is_fetching = False
-        self.upd_lbl.text = 'No stocks added'
-        show_msg(
-            'No Stocks',
-            'Add some stocks first!\n'
-            'Go to Add tab.')
 
     @mainthread
     def _done(self):
@@ -1076,7 +1488,7 @@ class PortScreen(Screen):
     def _build(self):
         root = BoxLayout(orientation='vertical')
         set_bg(root, BG)
-        hdr = L('Portfolio', size=16,
+        hdr = L('Portfolio Details', size=16,
                 bold=True, color=BLUE,
                 height=46, halign='center')
         sv = ScrollView(do_scroll_x=False)
@@ -1115,6 +1527,16 @@ class PortScreen(Screen):
             cmp_s = (f"Rs {h['cmp']:,.2f}"
                      if h['cmp']
                      else 'No price')
+
+            vol_s = ''
+            if h['vol']:
+                vol_s = (
+                    f"\nVolume: {h['vol']:,}")
+            src_s = ''
+            if h['src']:
+                src_s = (
+                    f"\nSource: {h['src']}")
+
             txt = (
                 f"[b]{h['symbol']}[/b]"
                 f" - {h['company']}\n"
@@ -1122,6 +1544,12 @@ class PortScreen(Screen):
                 f"Qty: {h['cq']}"
                 f"  WACC: Rs {h['wacc']:,.2f}\n"
                 f"CMP: {cmp_s}\n"
+                f"Day: Rs {h['dchg']:+,.2f}"
+                f" ({h['dpct']:+.2f}%)\n"
+                f"High: Rs {h['high']:,.2f}"
+                f"  Low: Rs {h['low']:,.2f}"
+                f"{vol_s}"
+                f"{src_s}\n\n"
                 f"Cost: Rs {h['tc']:,.2f}\n"
                 f"Value: Rs {h['cv']:,.2f}\n"
                 f"P/L: Rs {h['upl']:,.2f}"
@@ -1367,12 +1795,11 @@ class AddScreen(Screen):
 
 
 # ══════════════════════════════
-# HISTORY SCREEN
+# WATCHLIST SCREEN
 # ══════════════════════════════
-class HistoryScreen(Screen):
+class WatchScreen(Screen):
     def __init__(self, **kw):
-        super().__init__(
-            name='history', **kw)
+        super().__init__(name='watch', **kw)
         self.db = DB.get()
         self._built = False
 
@@ -1385,70 +1812,415 @@ class HistoryScreen(Screen):
     def _build(self):
         root = BoxLayout(orientation='vertical')
         set_bg(root, BG)
-        hdr = L('History', size=15,
-                bold=True, color=BLUE,
+
+        hdr = L('Watchlist', size=16,
+                bold=True, color=PURPLE,
                 height=46, halign='center')
-        sv = ScrollView(do_scroll_x=False)
-        self.hbox = BoxLayout(
+
+        # Add form
+        form_card = BoxLayout(
             orientation='vertical',
-            size_hint_y=None, spacing=dp(5),
+            padding=dp(10),
+            spacing=dp(5),
+            size_hint_y=None,
+            height=dp(200))
+        set_card_bg(form_card, CARD)
+
+        form_card.add_widget(L(
+            'Add to Watchlist',
+            size=12, bold=True,
+            color=CYAN, height=25))
+
+        r1 = BoxLayout(
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(5))
+        self.w_sym = I('Symbol', height=40)
+        self.w_comp = I('Company', height=40)
+        r1.add_widget(self.w_sym)
+        r1.add_widget(self.w_comp)
+        form_card.add_widget(r1)
+
+        r2 = BoxLayout(
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(5))
+        self.w_buy = I('Buy target Rs',
+            input_filter='float', height=40)
+        self.w_sell = I('Sell target Rs',
+            input_filter='float', height=40)
+        r2.add_widget(self.w_buy)
+        r2.add_widget(self.w_sell)
+        form_card.add_widget(r2)
+
+        self.w_notes = I(
+            'Notes (optional)', height=40)
+        form_card.add_widget(self.w_notes)
+
+        r3 = BoxLayout(
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(5))
+        r3.add_widget(B(
+            'Add', self._add_watch,
+            bg=GREEN, height=40))
+        r3.add_widget(B(
+            'Clear', self._clear_form,
+            bg=DIM, height=40))
+        form_card.add_widget(r3)
+
+        # Watchlist items
+        sv = ScrollView(do_scroll_x=False)
+        self.wbox = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            spacing=dp(5),
             padding=dp(8))
-        self.hbox.bind(
+        self.wbox.bind(
             minimum_height=
-            self.hbox.setter('height'))
-        sv.add_widget(self.hbox)
-        nav = make_nav(self.manager, 'history')
+            self.wbox.setter('height'))
+        sv.add_widget(self.wbox)
+
+        nav = make_nav(self.manager, 'watch')
+
         root.add_widget(hdr)
+        root.add_widget(form_card)
         root.add_widget(sv)
         root.add_widget(nav)
         self.add_widget(root)
 
+    def _add_watch(self):
+        try:
+            sym = (self.w_sym.text
+                   .upper().strip())
+            comp = self.w_comp.text.strip()
+            buy = float(
+                self.w_buy.text or '0')
+            sell = float(
+                self.w_sell.text or '0')
+            notes = self.w_notes.text.strip()
+
+            if not sym:
+                show_msg('Error',
+                         'Symbol required!')
+                return
+
+            self.db.run('''
+                INSERT OR REPLACE INTO
+                watchlist(symbol, company,
+                    target_buy, target_sell,
+                    notes, added_date)
+                VALUES(?,?,?,?,?,?)
+            ''', (
+                sym, comp, buy, sell, notes,
+                str(datetime.date.today())
+            ))
+            show_msg(
+                'Added!',
+                f'{sym} added to watchlist')
+            self._clear_form()
+            self._update()
+        except Exception as e:
+            show_msg('Error', str(e))
+
+    def _clear_form(self):
+        for f in [self.w_sym, self.w_comp,
+                  self.w_buy, self.w_sell,
+                  self.w_notes]:
+            f.text = ''
+
+    def _remove(self, sym):
+        self.db.run(
+            'DELETE FROM watchlist'
+            ' WHERE symbol=?', (sym,))
+        self._update()
+
     def _update(self):
-        self.hbox.clear_widgets()
-        txns = self.db.all(
-            'SELECT * FROM transactions'
-            ' ORDER BY trans_date DESC,'
-            ' id DESC LIMIT 50')
-        if not txns:
-            self.hbox.add_widget(L(
-                '  No transactions',
-                size=13, color=DIM,
+        self.wbox.clear_widgets()
+        wls = self.db.all(
+            'SELECT * FROM watchlist'
+            ' ORDER BY symbol')
+
+        if not wls:
+            self.wbox.add_widget(L(
+                '  No watchlist items.\n'
+                '  Add stocks to watch.',
+                size=12, color=DIM,
                 height=60))
             return
-        for t in txns:
-            is_buy = (
-                t['trans_type'] == 'BUY')
-            col = GREEN if is_buy else RED
+
+        for w in wls:
+            sym = w['symbol']
+            pc = self.db.one(
+                'SELECT * FROM prices'
+                ' WHERE symbol=?', (sym,))
+            cmp_ = pc['price'] if pc else 0
+
+            buy = w['target_buy'] or 0
+            sell = w['target_sell'] or 0
+
+            # Determine status
+            status = ''
+            status_c = DIM
+            if cmp_ and buy and cmp_ <= buy:
+                status = 'BUY NOW!'
+                status_c = GREEN
+            elif cmp_ and sell and cmp_ >= sell:
+                status = 'SELL NOW!'
+                status_c = GREEN
+            elif cmp_ and buy:
+                diff = cmp_ - buy
+                status = (
+                    f'Rs {diff:+.2f} vs buy')
+                status_c = (
+                    ORANGE if diff > 0
+                    else YELLOW)
+
             card = BoxLayout(
+                orientation='vertical',
+                padding=dp(10),
+                spacing=dp(3),
                 size_hint_y=None,
-                height=dp(70),
-                padding=dp(10))
+                height=dp(120))
             set_card_bg(card, CARD, 6)
-            txt = (
-                f"[b]{t['trans_type']}"
-                f" {t['symbol']}[/b]"
-                f"  {t['trans_date']}\n"
-                f"Qty: {t['quantity']} x"
-                f" Rs {t['price_per_share']:.2f}\n"
-                f"Net:"
-                f" Rs {t['net_amount']:,.2f}"
-            )
-            lbl = Label(
-                text=txt, font_size=sp(11),
-                color=col, markup=True,
-                halign='left',
+
+            top = BoxLayout(
                 size_hint_y=None,
-                height=dp(60))
-            lbl.bind(
-                size=lambda i, v:
-                setattr(i, 'text_size',
-                        (v[0], None)))
-            card.add_widget(lbl)
-            self.hbox.add_widget(card)
+                height=dp(25))
+            top.add_widget(L(
+                f"[b]{sym}[/b] "
+                f"{w['company'][:20]}",
+                size=12, markup=True,
+                color=TEXT))
+            rm_btn = Button(
+                text='X',
+                font_size=sp(11),
+                background_normal='',
+                background_color=RED,
+                color=WHITE,
+                size_hint_x=None,
+                width=dp(30))
+            rm_btn.bind(
+                on_press=lambda x, s=sym:
+                self._remove(s))
+            top.add_widget(rm_btn)
+            card.add_widget(top)
+
+            info = L(
+                f"CMP: Rs {cmp_:,.2f}"
+                f"  Buy: Rs {buy:,.2f}"
+                f"  Sell: Rs {sell:,.2f}",
+                size=10, color=DIM, height=20)
+            card.add_widget(info)
+
+            if status:
+                card.add_widget(L(
+                    status, size=11,
+                    color=status_c,
+                    bold=True, height=22))
+
+            if w['notes']:
+                card.add_widget(L(
+                    w['notes'], size=9,
+                    color=DIM, height=18))
+
+            self.wbox.add_widget(card)
 
 
 # ══════════════════════════════
-# INFO / DISCLAIMER SCREEN
+# MANUAL PRICE ENTRY SCREEN
+# ══════════════════════════════
+class ManualScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(name='manual', **kw)
+        self.db = DB.get()
+        self._built = False
+
+    def on_enter(self):
+        if not self._built:
+            self._build()
+            self._built = True
+        self._update()
+
+    def _build(self):
+        root = BoxLayout(orientation='vertical')
+        set_bg(root, BG)
+
+        hdr = L('Manual Price Entry', size=15,
+                bold=True, color=ORANGE,
+                height=46, halign='center')
+
+        # Info
+        info = L(
+            '  Enter prices manually for any stock\n'
+            '  100% legal, no internet needed',
+            size=10, color=CYAN, height=40)
+
+        # Add manual price form
+        form_card = BoxLayout(
+            orientation='vertical',
+            padding=dp(10),
+            spacing=dp(5),
+            size_hint_y=None,
+            height=dp(180))
+        set_card_bg(form_card, CARD)
+
+        self.m_sym = I('Stock Symbol')
+        form_card.add_widget(self.m_sym)
+
+        self.m_price = I(
+            'Current Price Rs',
+            input_filter='float')
+        form_card.add_widget(self.m_price)
+
+        r1 = BoxLayout(
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(5))
+        self.m_high = I(
+            'Day High (opt)',
+            input_filter='float', height=40)
+        self.m_low = I(
+            'Day Low (opt)',
+            input_filter='float', height=40)
+        r1.add_widget(self.m_high)
+        r1.add_widget(self.m_low)
+        form_card.add_widget(r1)
+
+        form_card.add_widget(B(
+            'Save Price', self._save,
+            bg=GREEN, height=44))
+
+        # Current manual prices
+        sv = ScrollView(do_scroll_x=False)
+        self.pbox = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            spacing=dp(5),
+            padding=dp(8))
+        self.pbox.bind(
+            minimum_height=
+            self.pbox.setter('height'))
+        sv.add_widget(self.pbox)
+
+        nav = make_nav(self.manager, 'manual')
+
+        root.add_widget(hdr)
+        root.add_widget(info)
+        root.add_widget(form_card)
+        root.add_widget(sv)
+        root.add_widget(nav)
+        self.add_widget(root)
+
+    def _save(self):
+        try:
+            sym = (self.m_sym.text
+                   .upper().strip())
+            price = float(
+                self.m_price.text or '0')
+
+            if not sym or price <= 0:
+                show_msg('Error',
+                         'Symbol & Price needed!')
+                return
+
+            try:
+                high = float(
+                    self.m_high.text or '0')
+            except Exception:
+                high = 0
+            try:
+                low = float(
+                    self.m_low.text or '0')
+            except Exception:
+                low = 0
+
+            # Get existing price for prev
+            existing = self.db.one(
+                'SELECT price FROM prices'
+                ' WHERE symbol=?', (sym,))
+            prev = (existing['price']
+                    if existing else 0)
+
+            data = {
+                'price': price,
+                'prev': prev,
+                'high': high or price,
+                'low': low or price,
+                'vol': 0,
+            }
+            self.db.save_price(
+                sym, data, 'Manual')
+
+            show_msg(
+                'Saved!',
+                f'{sym} price: Rs {price:,.2f}')
+
+            self.m_sym.text = ''
+            self.m_price.text = ''
+            self.m_high.text = ''
+            self.m_low.text = ''
+            self._update()
+        except Exception as e:
+            show_msg('Error', str(e))
+
+    def _update(self):
+        self.pbox.clear_widgets()
+        prices = self.db.all(
+            'SELECT * FROM prices'
+            ' ORDER BY updated DESC LIMIT 30')
+
+        if not prices:
+            self.pbox.add_widget(L(
+                '  No prices saved yet.',
+                size=12, color=DIM,
+                height=50))
+            return
+
+        self.pbox.add_widget(L(
+            '  Recent Prices:',
+            size=11, color=CYAN,
+            bold=True, height=25))
+
+        for p in prices:
+            card = BoxLayout(
+                orientation='horizontal',
+                padding=dp(8),
+                size_hint_y=None,
+                height=dp(45))
+            set_card_bg(card, CARD, 5)
+            card.add_widget(L(
+                f"[b]{p['symbol']}[/b]",
+                size=11, markup=True,
+                size_hint_x=0.25))
+            card.add_widget(L(
+                f"Rs {p['price']:,.2f}",
+                size=11, color=BLUE,
+                size_hint_x=0.3,
+                halign='center'))
+            src = (p['source']
+                   if 'source' in p.keys()
+                   and p['source']
+                   else 'Unknown')
+            card.add_widget(L(
+                src, size=9,
+                color=DIM,
+                size_hint_x=0.25,
+                halign='center'))
+            try:
+                dt = p['updated'][11:16]
+            except Exception:
+                dt = ''
+            card.add_widget(L(
+                dt, size=9,
+                color=DIM,
+                size_hint_x=0.2,
+                halign='right'))
+            self.pbox.add_widget(card)
+
+
+# ══════════════════════════════
+# INFO SCREEN
 # ══════════════════════════════
 class InfoScreen(Screen):
     def __init__(self, **kw):
@@ -1471,66 +2243,63 @@ class InfoScreen(Screen):
         sv = ScrollView(do_scroll_x=False)
 
         info_text = (
-            "[b]NEPSE Portfolio Tracker[/b]\n"
-            "Version 1.0\n\n"
+            "[b]NEPSE Portfolio Tracker v2.0[/b]\n\n"
             f"{'─'*32}\n\n"
             "[b]FEATURES:[/b]\n"
-            "• Track your NEPSE holdings\n"
-            "• Auto WACC calculation\n"
-            "• All SEBON charges included\n"
+            "• Portfolio tracking with WACC\n"
+            "• Manual price entry\n"
+            "• Auto-fetch from 3rd parties\n"
+            "• NEPSE Index tracking\n"
+            "• Watchlist with alerts\n"
+            "• All SEBON charges\n"
             "• CGT: 7.5% short / 10% long\n"
-            "• Live prices from public sources\n"
-            "• Personal use offline app\n\n"
+            "• Buy/Sell target prices\n\n"
             f"{'─'*32}\n\n"
-            "[b]CHARGES (per SEBON):[/b]\n"
-            "• Broker: 0.24%-0.40% slabs\n"
-            "• SEBON Fee: 0.015%\n"
-            "• DP Charge: Rs 25\n"
-            "• Capital Mkt Fee: 0.2% (BUY)\n"
+            "[b][color=40D5E0]DATA SOURCES:[/color][/b]\n\n"
+            "Third-party public sources only:\n"
+            "• ShareSansar.com\n"
+            "• NEPSE Alpha.com\n"
+            "• MeroLagani.com\n\n"
+            "[b]No direct NEPSE fetching[/b]\n\n"
+            f"{'─'*32}\n\n"
+            "[b][color=D29922]RATE LIMITING:[/color][/b]\n\n"
+            "• 3 seconds between fetches\n"
+            "• Auto-refresh: every 10 min\n"
+            "• Manual: max 1 per minute\n"
+            "• Only in market hours\n\n"
+            f"{'─'*32}\n\n"
+            "[b]CHARGES (SEBON):[/b]\n"
+            "• Broker: 0.24%-0.40%\n"
+            "• SEBON: 0.015%\n"
+            "• DP: Rs 25\n"
+            "• CM Fee: 0.2% (BUY only)\n"
             "• Min broker: Rs 10\n\n"
-            "[b]CAPITAL GAINS TAX:[/b]\n"
+            "[b]CGT:[/b]\n"
             "• Held ≤ 365 days: 7.5%\n"
-            "• Held > 365 days: 10%\n\n"
+            "• Held > 365 days: 10%\n"
+            "• Dividend TDS: 5%\n\n"
             "[b]MARKET HOURS:[/b]\n"
             "• Monday to Friday\n"
             "• 11:00 AM - 3:00 PM\n\n"
             f"{'─'*32}\n\n"
             "[b][color=D29922]DATA & PRIVACY:[/color][/b]\n\n"
-            "• All data stored ONLY on\n"
-            "  your device\n"
-            "• No internet needed except\n"
-            "  for live price fetching\n"
-            "• No user accounts required\n"
-            "• No personal data sent anywhere\n"
-            "• Auto-refresh: every 10 min\n"
-            "  (only in market hours)\n"
-            "• Manual refresh: max 1 per min\n"
-            "• 3+ second delay between\n"
-            "  price fetches (respectful)\n\n"
+            "• All data stored on YOUR device\n"
+            "• No accounts required\n"
+            "• No data sent anywhere\n"
+            "• 100% offline capable\n"
+            "• (with manual entry)\n\n"
             f"{'─'*32}\n\n"
             "[b][color=D29922]DISCLAIMER:[/color][/b]\n\n"
-            "This app is for PERSONAL USE\n"
-            "and educational purposes only.\n\n"
-            "Price data is from publicly\n"
-            "available sources including:\n"
-            "• nepalstock.com.np\n"
-            "• merolagani.com\n\n"
-            "The app respects server\n"
-            "resources by using delays and\n"
-            "limiting refresh frequency.\n\n"
-            "Not affiliated with NEPSE,\n"
-            "SEBON, or any broker.\n\n"
-            "[b]Always verify prices from\n"
-            "official sources before making\n"
-            "investment decisions.[/b]\n\n"
+            "For personal use only.\n"
+            "Price data from public sources.\n"
+            "Not affiliated with NEPSE, SEBON,\n"
+            "or any broker.\n\n"
+            "[b]Verify prices from official\n"
+            "sources before investing.[/b]\n\n"
             "All calculations are estimates.\n"
-            "Actual charges may vary.\n"
-            "Consult your broker for\n"
-            "official statements.\n\n"
+            "Consult your broker for actual\n"
+            "transaction charges.\n\n"
             f"{'─'*32}\n\n"
-            "[b]CREDITS:[/b]\n"
-            "Built with Python & Kivy\n"
-            "For NEPSE investors\n\n"
             "Made with care for the\n"
             "Nepal investor community 🇳🇵\n\n"
         )
@@ -1561,7 +2330,7 @@ class InfoScreen(Screen):
 
 
 # ══════════════════════════════
-# MAIN APP with ETHICAL AUTO-REFRESH
+# MAIN APP
 # ══════════════════════════════
 class NEPSEApp(App):
     def build(self):
@@ -1573,29 +2342,18 @@ class NEPSEApp(App):
         sm.add_widget(DashScreen())
         sm.add_widget(PortScreen())
         sm.add_widget(AddScreen())
-        sm.add_widget(HistoryScreen())
+        sm.add_widget(WatchScreen())
+        sm.add_widget(ManualScreen())
         sm.add_widget(InfoScreen())
 
-        # ETHICAL AUTO-REFRESH
-        # Every 10 minutes
-        # Only during market hours
-        # Only if user has stocks
         Clock.schedule_interval(
-            self._ethical_auto_refresh,
-            AUTO_REFRESH_MINUTES * 60
-        )
+            self._auto_refresh,
+            AUTO_REFRESH_MINUTES * 60)
 
         return sm
 
-    def _ethical_auto_refresh(self, dt):
-        """
-        Ethical auto-refresh:
-        - Only during market hours
-        - Only if user has stocks
-        - Respects rate limits
-        - Small delays between fetches
-        """
-        # Only during market hours
+    def _auto_refresh(self, dt):
+        """Ethical auto-refresh"""
         if MARKET_ONLY_AUTO:
             if not Calc.is_open():
                 return
@@ -1606,17 +2364,23 @@ class NEPSEApp(App):
             ' FROM transactions'
             ' WHERE trans_type="BUY"')
 
-        # No stocks? Don't fetch
         if not syms:
             return
 
         def fetch():
+            # NEPSE Index
+            idx = Fetcher.fetch_nepse_index()
+            if idx:
+                db.save_index(idx)
+
+            # Portfolio prices
             for s in syms:
-                d = Fetcher.fetch(
+                d = Fetcher.fetch_price(
                     s['symbol'])
                 if d:
                     db.save_price(
-                        s['symbol'], d)
+                        s['symbol'], d,
+                        d.get('source',''))
 
         threading.Thread(
             target=fetch,
