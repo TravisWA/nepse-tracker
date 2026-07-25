@@ -1,6 +1,15 @@
 """
-NEPSE Portfolio Tracker - Android App
-Simplified version without BeautifulSoup
+NEPSE Portfolio Tracker
+Personal Use App with Ethical Rate Limiting
+
+DISCLAIMER:
+- For personal portfolio tracking only
+- Uses publicly available NEPSE price data
+- Respects server load with 3+ second delays
+- Auto-refresh limited to 10 minutes
+- Not for commercial or automated trading use
+- User should verify prices from official
+  NEPSE sources before making decisions
 """
 
 import os
@@ -8,6 +17,7 @@ import sqlite3
 import datetime
 import threading
 import re
+import time
 
 os.environ['KIVY_NO_CONSOLELOG'] = '1'
 
@@ -31,6 +41,14 @@ from kivy.graphics import (
 )
 
 # ══════════════════════════════
+# ETHICAL FETCHING SETTINGS
+# ══════════════════════════════
+FETCH_DELAY_SECONDS = 3.0       # Wait 3s between requests
+AUTO_REFRESH_MINUTES = 10       # Auto refresh every 10 min
+MIN_MANUAL_REFRESH_SECS = 60    # Manual refresh: max once per min
+MARKET_ONLY_AUTO = True         # Only refresh in market hours
+
+# ══════════════════════════════
 # COLORS
 # ══════════════════════════════
 BG     = [0.05, 0.07, 0.09, 1]
@@ -50,6 +68,9 @@ WHITE  = [1.00, 1.00, 1.00, 1]
 
 # ══════════════════════════════
 # CHARGE CALCULATOR
+# All rates per SEBON regulations
+# CGT: 7.5% short, 10% long
+# Market: Mon-Fri 11AM-3PM
 # ══════════════════════════════
 class Calc:
     SLABS = [
@@ -298,6 +319,7 @@ class DB:
             ('target1', '10'),
             ('target2', '20'),
             ('target3', '30'),
+            ('last_manual_refresh', '0'),
         ]
         for k, v in defaults:
             self.conn.execute(
@@ -341,10 +363,22 @@ class DB:
             ' WHERE key=?', (key,))
         return r['value'] if r else default
 
+    def set_setting(self, key, val):
+        self.run(
+            '''INSERT OR REPLACE INTO
+               app_settings(key,value)
+               VALUES(?,?)''',
+            (key, str(val)))
+
 
 # ══════════════════════════════
-# DATA FETCHER - NO BeautifulSoup
-# Uses regex instead
+# ETHICAL DATA FETCHER
+# 
+# Respects server resources:
+# - 3 second delay between requests
+# - Only fetches user's stocks
+# - Standard browser headers
+# - No aggressive polling
 # ══════════════════════════════
 class Fetcher:
     UA = {
@@ -354,12 +388,28 @@ class Fetcher:
         )
     }
 
+    # Track last fetch time to enforce delays
+    _last_fetch_time = 0
+
+    @classmethod
+    def _wait_delay(cls):
+        """Enforce minimum delay between requests"""
+        elapsed = time.time() - cls._last_fetch_time
+        if elapsed < FETCH_DELAY_SECONDS:
+            wait = FETCH_DELAY_SECONDS - elapsed
+            time.sleep(wait)
+        cls._last_fetch_time = time.time()
+
     @classmethod
     def fetch(cls, symbol):
-        import time
-        time.sleep(1.2)
+        """
+        Fetch stock price - respects rate limits
+        Waits 3+ seconds between each request
+        """
+        # Wait for rate limit
+        cls._wait_delay()
 
-        # Source 1: NEPSE Official API
+        # Source 1: NEPSE Official Public API
         try:
             import requests
             r = requests.get(
@@ -367,7 +417,7 @@ class Fetcher:
                 '/api/nots/nepse-data'
                 '/today-price',
                 headers=cls.UA,
-                timeout=10,
+                timeout=15,
                 verify=True
             )
             if r.status_code == 200:
@@ -398,10 +448,12 @@ class Fetcher:
         except Exception:
             pass
 
-        # Source 2: MeroLagani via regex
+        # Extra wait before trying source 2
+        time.sleep(2)
+
+        # Source 2: MeroLagani (backup)
         try:
             import requests
-            time.sleep(1.0)
             url = (
                 'https://merolagani.com'
                 '/CompanyDetail.aspx'
@@ -409,7 +461,7 @@ class Fetcher:
             )
             r = requests.get(
                 url, headers=cls.UA,
-                timeout=10, verify=True)
+                timeout=15, verify=True)
             if r.status_code == 200:
                 text = r.text
 
@@ -448,6 +500,31 @@ class Fetcher:
             pass
 
         return None
+
+    @classmethod
+    def can_manual_refresh(cls, db):
+        """Check if enough time passed since last manual refresh"""
+        try:
+            last = float(
+                db.setting(
+                    'last_manual_refresh',
+                    '0'))
+            now = time.time()
+            if now - last < MIN_MANUAL_REFRESH_SECS:
+                wait = int(
+                    MIN_MANUAL_REFRESH_SECS
+                    - (now - last))
+                return False, wait
+            return True, 0
+        except Exception:
+            return True, 0
+
+    @classmethod
+    def mark_manual_refresh(cls, db):
+        """Record time of manual refresh"""
+        db.set_setting(
+            'last_manual_refresh',
+            time.time())
 
 
 # ══════════════════════════════
@@ -715,7 +792,7 @@ def show_msg(title, msg):
         title=title, title_color=BLUE,
         content=content,
         size_hint=(0.88, None),
-        height=dp(240),
+        height=dp(280),
         background='',
         background_color=CARD)
     ok.bind(on_press=popup.dismiss)
@@ -729,9 +806,8 @@ def make_nav(sm, current):
         ('Home', 'dash'),
         ('Port', 'port'),
         ('Add',  'add'),
-        ('Calc', 'calc'),
-        ('Div',  'bonus'),
         ('Hist', 'history'),
+        ('Info', 'info'),
     ]
     nav = BoxLayout(
         orientation='horizontal',
@@ -762,6 +838,7 @@ class DashScreen(Screen):
         super().__init__(name='dash', **kw)
         self.port = Portfolio()
         self._built = False
+        self._is_fetching = False
 
     def on_enter(self):
         if not self._built:
@@ -796,7 +873,8 @@ class DashScreen(Screen):
                     self._refresh,
                     bg=GREEN, height=42)
         self.upd_lbl = L(
-            'Tap Refresh', size=9,
+            'Auto-refresh: 10 min',
+            size=9,
             color=DIM, height=42,
             halign='right')
         ref_row.add_widget(ref_btn)
@@ -908,23 +986,68 @@ class DashScreen(Screen):
             self.holdings_box.add_widget(row)
 
     def _refresh(self):
-        self.upd_lbl.text = 'Fetching...'
+        # Prevent multiple simultaneous fetches
+        if self._is_fetching:
+            show_msg(
+                'Please Wait',
+                'Already fetching prices.\n'
+                'Please wait for it to finish.')
+            return
+
+        # Check rate limit
         db = DB.get()
+        can_refresh, wait = (
+            Fetcher.can_manual_refresh(db))
+
+        if not can_refresh:
+            show_msg(
+                'Please Wait',
+                f'To protect NEPSE server,\n'
+                f'manual refresh limited to\n'
+                f'once per minute.\n\n'
+                f'Please wait {wait} seconds.')
+            return
+
+        self._is_fetching = True
+        Fetcher.mark_manual_refresh(db)
+        self.upd_lbl.text = (
+            'Fetching (3s per stock)...')
+
         def fetch():
-            syms = db.all(
-                'SELECT DISTINCT symbol'
-                ' FROM transactions'
-                ' WHERE trans_type="BUY"')
-            for s in syms:
-                d = Fetcher.fetch(
-                    s['symbol'])
-                if d:
-                    db.save_price(
-                        s['symbol'], d)
-            Clock.schedule_once(
-                lambda dt: self._done(), 0)
+            try:
+                syms = db.all(
+                    'SELECT DISTINCT symbol'
+                    ' FROM transactions'
+                    ' WHERE trans_type="BUY"')
+                total = len(syms)
+                if total == 0:
+                    Clock.schedule_once(
+                        lambda dt:
+                        self._no_stocks(), 0)
+                    return
+
+                for i, s in enumerate(syms):
+                    d = Fetcher.fetch(
+                        s['symbol'])
+                    if d:
+                        db.save_price(
+                            s['symbol'], d)
+                Clock.schedule_once(
+                    lambda dt: self._done(), 0)
+            finally:
+                self._is_fetching = False
+
         threading.Thread(
             target=fetch, daemon=True).start()
+
+    @mainthread
+    def _no_stocks(self):
+        self._is_fetching = False
+        self.upd_lbl.text = 'No stocks added'
+        show_msg(
+            'No Stocks',
+            'Add some stocks first!\n'
+            'Go to Add tab.')
 
     @mainthread
     def _done(self):
@@ -1244,70 +1367,6 @@ class AddScreen(Screen):
 
 
 # ══════════════════════════════
-# CALC SCREEN (Placeholder)
-# ══════════════════════════════
-class CalcScreen(Screen):
-    def __init__(self, **kw):
-        super().__init__(name='calc', **kw)
-        self._built = False
-
-    def on_enter(self):
-        if not self._built:
-            self._build()
-            self._built = True
-
-    def _build(self):
-        root = BoxLayout(orientation='vertical')
-        set_bg(root, BG)
-        hdr = L('Calculator', size=15,
-                bold=True, color=BLUE,
-                height=46, halign='center')
-        body = L(
-            '\n\nCalculator coming\n\n'
-            'Use Add screen for now\n'
-            'It shows charges when you\n'
-            'tap Calculate button',
-            size=13, color=DIM,
-            halign='center')
-        nav = make_nav(self.manager, 'calc')
-        root.add_widget(hdr)
-        root.add_widget(body)
-        root.add_widget(nav)
-        self.add_widget(root)
-
-
-# ══════════════════════════════
-# BONUS SCREEN (Placeholder)
-# ══════════════════════════════
-class BonusScreen(Screen):
-    def __init__(self, **kw):
-        super().__init__(name='bonus', **kw)
-        self._built = False
-
-    def on_enter(self):
-        if not self._built:
-            self._build()
-            self._built = True
-
-    def _build(self):
-        root = BoxLayout(orientation='vertical')
-        set_bg(root, BG)
-        hdr = L('Bonus/Rights', size=15,
-                bold=True, color=PURPLE,
-                height=46, halign='center')
-        body = L(
-            '\n\nBonus/Rights/Dividend\n'
-            'features coming soon',
-            size=13, color=DIM,
-            halign='center')
-        nav = make_nav(self.manager, 'bonus')
-        root.add_widget(hdr)
-        root.add_widget(body)
-        root.add_widget(nav)
-        self.add_widget(root)
-
-
-# ══════════════════════════════
 # HISTORY SCREEN
 # ══════════════════════════════
 class HistoryScreen(Screen):
@@ -1389,21 +1448,179 @@ class HistoryScreen(Screen):
 
 
 # ══════════════════════════════
-# MAIN APP
+# INFO / DISCLAIMER SCREEN
+# ══════════════════════════════
+class InfoScreen(Screen):
+    def __init__(self, **kw):
+        super().__init__(name='info', **kw)
+        self._built = False
+
+    def on_enter(self):
+        if not self._built:
+            self._build()
+            self._built = True
+
+    def _build(self):
+        root = BoxLayout(orientation='vertical')
+        set_bg(root, BG)
+
+        hdr = L('About & Info', size=15,
+                bold=True, color=BLUE,
+                height=46, halign='center')
+
+        sv = ScrollView(do_scroll_x=False)
+
+        info_text = (
+            "[b]NEPSE Portfolio Tracker[/b]\n"
+            "Version 1.0\n\n"
+            f"{'─'*32}\n\n"
+            "[b]FEATURES:[/b]\n"
+            "• Track your NEPSE holdings\n"
+            "• Auto WACC calculation\n"
+            "• All SEBON charges included\n"
+            "• CGT: 7.5% short / 10% long\n"
+            "• Live prices from public sources\n"
+            "• Personal use offline app\n\n"
+            f"{'─'*32}\n\n"
+            "[b]CHARGES (per SEBON):[/b]\n"
+            "• Broker: 0.24%-0.40% slabs\n"
+            "• SEBON Fee: 0.015%\n"
+            "• DP Charge: Rs 25\n"
+            "• Capital Mkt Fee: 0.2% (BUY)\n"
+            "• Min broker: Rs 10\n\n"
+            "[b]CAPITAL GAINS TAX:[/b]\n"
+            "• Held ≤ 365 days: 7.5%\n"
+            "• Held > 365 days: 10%\n\n"
+            "[b]MARKET HOURS:[/b]\n"
+            "• Monday to Friday\n"
+            "• 11:00 AM - 3:00 PM\n\n"
+            f"{'─'*32}\n\n"
+            "[b][color=D29922]DATA & PRIVACY:[/color][/b]\n\n"
+            "• All data stored ONLY on\n"
+            "  your device\n"
+            "• No internet needed except\n"
+            "  for live price fetching\n"
+            "• No user accounts required\n"
+            "• No personal data sent anywhere\n"
+            "• Auto-refresh: every 10 min\n"
+            "  (only in market hours)\n"
+            "• Manual refresh: max 1 per min\n"
+            "• 3+ second delay between\n"
+            "  price fetches (respectful)\n\n"
+            f"{'─'*32}\n\n"
+            "[b][color=D29922]DISCLAIMER:[/color][/b]\n\n"
+            "This app is for PERSONAL USE\n"
+            "and educational purposes only.\n\n"
+            "Price data is from publicly\n"
+            "available sources including:\n"
+            "• nepalstock.com.np\n"
+            "• merolagani.com\n\n"
+            "The app respects server\n"
+            "resources by using delays and\n"
+            "limiting refresh frequency.\n\n"
+            "Not affiliated with NEPSE,\n"
+            "SEBON, or any broker.\n\n"
+            "[b]Always verify prices from\n"
+            "official sources before making\n"
+            "investment decisions.[/b]\n\n"
+            "All calculations are estimates.\n"
+            "Actual charges may vary.\n"
+            "Consult your broker for\n"
+            "official statements.\n\n"
+            f"{'─'*32}\n\n"
+            "[b]CREDITS:[/b]\n"
+            "Built with Python & Kivy\n"
+            "For NEPSE investors\n\n"
+            "Made with care for the\n"
+            "Nepal investor community 🇳🇵\n\n"
+        )
+
+        info_lbl = Label(
+            text=info_text,
+            font_size=sp(12),
+            color=TEXT,
+            markup=True,
+            halign='left',
+            size_hint_y=None,
+            padding=(dp(15), dp(10)))
+        info_lbl.bind(
+            size=lambda i, v:
+            setattr(i, 'text_size',
+                    (v[0]-dp(20), None)),
+            texture_size=lambda i, v:
+            setattr(i, 'height',
+                    v[1] + dp(20)))
+
+        sv.add_widget(info_lbl)
+
+        nav = make_nav(self.manager, 'info')
+        root.add_widget(hdr)
+        root.add_widget(sv)
+        root.add_widget(nav)
+        self.add_widget(root)
+
+
+# ══════════════════════════════
+# MAIN APP with ETHICAL AUTO-REFRESH
 # ══════════════════════════════
 class NEPSEApp(App):
     def build(self):
         self.title = 'NEPSE Tracker'
         DB.get()
+
         sm = ScreenManager(
             transition=SlideTransition())
         sm.add_widget(DashScreen())
         sm.add_widget(PortScreen())
         sm.add_widget(AddScreen())
-        sm.add_widget(CalcScreen())
-        sm.add_widget(BonusScreen())
         sm.add_widget(HistoryScreen())
+        sm.add_widget(InfoScreen())
+
+        # ETHICAL AUTO-REFRESH
+        # Every 10 minutes
+        # Only during market hours
+        # Only if user has stocks
+        Clock.schedule_interval(
+            self._ethical_auto_refresh,
+            AUTO_REFRESH_MINUTES * 60
+        )
+
         return sm
+
+    def _ethical_auto_refresh(self, dt):
+        """
+        Ethical auto-refresh:
+        - Only during market hours
+        - Only if user has stocks
+        - Respects rate limits
+        - Small delays between fetches
+        """
+        # Only during market hours
+        if MARKET_ONLY_AUTO:
+            if not Calc.is_open():
+                return
+
+        db = DB.get()
+        syms = db.all(
+            'SELECT DISTINCT symbol'
+            ' FROM transactions'
+            ' WHERE trans_type="BUY"')
+
+        # No stocks? Don't fetch
+        if not syms:
+            return
+
+        def fetch():
+            for s in syms:
+                d = Fetcher.fetch(
+                    s['symbol'])
+                if d:
+                    db.save_price(
+                        s['symbol'], d)
+
+        threading.Thread(
+            target=fetch,
+            daemon=True).start()
 
     def on_stop(self):
         db = DB.get()
