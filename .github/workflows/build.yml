@@ -7,20 +7,84 @@ on:
 
 jobs:
   build:
+    name: Build for Android
     runs-on: ubuntu-latest
+
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Build APK
-      uses: ArtemSBulgakov/buildozer-action@v1
-      id: buildozer
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
       with:
-        command: buildozer android debug
-        buildozer_version: stable
+        python-version: '3.10'
+
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Cache buildozer files
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.buildozer
+          .buildozer
+        key: buildozer-cache-${{ hashFiles('buildozer.spec') }}
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git zip unzip \
+          autoconf libtool pkg-config \
+          zlib1g-dev libncurses-dev \
+          cmake libffi-dev libssl-dev \
+          build-essential ccache \
+          libltdl-dev
+
+    - name: Install Buildozer
+      run: |
+        python -m pip install --upgrade pip
+        pip install --upgrade wheel setuptools
+        pip install --upgrade Cython==0.29.36
+        pip install --upgrade buildozer
+
+    - name: Auto-accept Android SDK licenses
+      run: |
+        mkdir -p ~/.android
+        touch ~/.android/repositories.cfg
+        yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+    - name: Build APK
+      env:
+        ANDROIDAPI: "31"
+        ANDROIDMINAPI: "21"
+      run: |
+        buildozer android debug 2>&1 | tee build.log
+        echo "=== BUILD FINISHED ==="
+        ls -la bin/ || echo "No bin folder"
+
+    - name: Show last log lines if failed
+      if: failure()
+      run: |
+        echo "=== LAST 100 LINES ==="
+        tail -100 build.log || true
 
     - name: Upload APK
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: NEPSE-Tracker-APK
-        path: ${{ steps.buildozer.outputs.filename }}
+        path: bin/*.apk
+        retention-days: 90
+        if-no-files-found: warn
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: build.log
+        retention-days: 30
